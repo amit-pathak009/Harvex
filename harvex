@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+Harvex - Ultimate URL Harvester 2026
+"""
+
+import argparse
+import re
+import subprocess
+import shutil
+import tempfile
+import os
+import sys
+import signal
+import json
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rich for beautiful, colorful output
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.panel import Panel
+    from rich import print as rprint
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+    class FakeConsole:
+        def print(self, text, **kwargs):
+            color_map = {
+                "green": "\033[92m", "bold green": "\033[1;92m",
+                "yellow": "\033[93m", "bold yellow": "\033[1;93m",
+                "red": "\033[91m", "bold red": "\033[1;91m",
+                "cyan": "\033[96m", "bold cyan": "\033[1;96m",
+                "magenta": "\033[95m", "white": "\033[97m"
+            }
+            style = str(kwargs.get("style", ""))
+            for k, v in color_map.items():
+                if k in style:
+                    print(v + str(text) + "\033[0m")
+                    return
+            print(text)
+        def rule(self, title="", style=""): print("\n" + "-"*70 + f"\n {title} \n" + "-"*70)
+    console = FakeConsole()
+    rprint = console.print
+
+URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
+
+def run_cmd(cmd, desc="", timeout=1800):
+    rprint(f"[bold green][+][/bold green] {desc or cmd}")
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, errors='replace')
+        return r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        rprint(f"[bold yellow][-] Timeout after {timeout}s[/bold yellow]")
+        return ""
+    except Exception as e:
+        rprint(f"[bold red][-] Error: {e}[/bold red]")
+        return ""
+
+def extract_clean_urls(text):
+    urls = {m.group(0).split('#')[0].rstrip('/') for m in URL_REGEX.finditer(text)}
+    exclude = {'.png','.jpg','.jpeg','.gif','.svg','.css','.woff','.ttf','.woff2','.ico','.pdf','.eot','.otf'}
+    return {u for u in urls if not any(u.lower().endswith(ext) for ext in exclude)}
+
+def extract_urls_from_urlfinder_json(json_text):
+    try:
+        data = json.loads(json_text)
+        return {item.get("url") for item in data if isinstance(item, dict) and "url" in item}
+    except:
+        return set()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="[bold cyan]Harvex - Ultimate URL Harvester 2026[/bold cyan]\n"
+                    "All-in-one passive + active URL & endpoint discovery tool\n"
+                    "Use only on authorized targets. Unauthorized scanning is illegal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("-t", "--target", help="Single domain")
+    parser.add_argument("-l", "--list", help="File with list of domains")
+    parser.add_argument("-p", "--proxy", help="Proxy URL (http:// or socks5://)")
+    parser.add_argument("-o", "--output", help="Final TXT file")
+    parser.add_argument("-oj", "--output-json", help="Final JSON file")
+    parser.add_argument("-oh", "--output-html", help="Final HTML report")
+    parser.add_argument("--output-dir", default="results", help="Output directory")
+    parser.add_argument("--include-subs", action="store_true", help="Enumerate subdomains first")
+    parser.add_argument("--live", action="store_true", help="Filter only live/responding URLs")
+    parser.add_argument("--no-uro", action="store_true", help="Skip uro deduplication (default: ON)")
+    parser.add_argument("--params-only", action="store_true", help="Keep only URLs with parameters")
+    parser.add_argument("--js-endpoints", action="store_true", help="Run LinkFinder on .js files")
+    parser.add_argument("--save-raw", action="store_true", help="Save raw tool outputs")
+    parser.add_argument("--auto-install", action="store_true", help="Try to auto-install missing tools")
+    parser.add_argument("--depth", type=int, default=10, help="Crawl depth (default: 10)")
+    parser.add_argument("--js", action="store_true", help="Enable JS parsing")
+    parser.add_argument("--skip", help="Comma-separated tools to skip (e.g. waymore,gospider)")
+    parser.add_argument("--timeout", type=int, default=1800, help="Per-tool timeout in seconds")
+    args = parser.parse_args()
+
+    if not args.target and not args.list:
+        console.rule("[bold magenta]Harvex Help Menu[/bold magenta]", style="magenta")
+        rprint("[yellow bold]WARNING: Use only on targets you have explicit written permission to test.[/yellow bold]")
+        rprint("[yellow]Unauthorized scanning may violate laws and terms of service.[/yellow]\n")
+        parser.print_help()
+        sys.exit(1)
+
+    console.rule("[bold cyan]Harvex - Ultimate URL Harvester 2026[/bold cyan]")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / "raw").mkdir(exist_ok=True)
+
+    domains = []
+    if args.target:
+        domains.append(args.target.strip())
+    if args.list:
+        try:
+            with open(args.list) as f:
+                domains.extend([line.strip() for line in f if line.strip()])
+        except Exception as e:
+            rprint(f"[bold red]Error reading list file: {e}[/bold red]")
+            sys.exit(1)
+
+    rprint(f"[bold green]Starting harvest for [cyan]{len(domains)}[/cyan] domain(s)...[/bold green]")
+
+    all_urls = set()
+    tool_counts = defaultdict(set)
+    skipped = [x.strip() for x in args.skip.split(",")] if args.skip else []
+    discovered_count = 0
+
+    def harvest(domain):
+        nonlocal discovered_count
+        local = set()
+        base = f"https://{domain}"
+
+        tasks = [
+            ("waymore",     f"waymore -i {domain} --stream"),
+            ("gau",         f"gau --subs {domain} --blacklist png,jpg,jpeg,gif,svg,css,woff,ttf,woff2,ico"),
+            ("waybackurls", f"echo {domain} | waybackurls"),
+            ("urlfinder",   f"urlfinder -d {domain} -silent"),
+            ("katana",      f"katana -u {base} -d {args.depth} -silent -c 50 {'-jc' if args.js else ''}"),
+            ("hakrawler",   f"echo {base} | hakrawler -d {min(5, args.depth)} -plain -subs"),
+            ("cariddi",     f"echo {base} | cariddi -md {args.depth} -plain"),
+            ("gospider",    f"gospider -s {base} -d {args.depth} -c 30 -t 20 -q --js --subs -a -r -K 2"),
+        ]
+
+        for name, cmd in tasks:
+            if name in skipped:
+                rprint(f"[bold yellow][SKIP] {name}[/bold yellow]")
+                continue
+
+            full_cmd = cmd
+            if args.proxy:
+                if name in ["katana", "urlfinder", "hakrawler", "cariddi"]:
+                    full_cmd += f" -proxy {args.proxy}"
+                elif name == "gospider":
+                    full_cmd += f" -p {args.proxy}"
+
+            out = run_cmd(full_cmd, name, timeout=args.timeout)
+            extracted = extract_clean_urls(out)
+            new_added = len(extracted - local)
+
+            local.update(extracted)
+            tool_counts[name].update(extracted)
+
+            if new_added > 0:
+                discovered_count += new_added
+                progress.update(task, description=f"[cyan]Harvesting... (discovered so far: {discovered_count:,} URLs)[/cyan]")
+
+            if args.save_raw and out:
+                (out_dir / "raw" / f"{name}_{domain.replace('.', '_')}.txt").write_text(out)
+
+        # pingc0y/URLFinder
+        if shutil.which("URLFinder") and "URLFinder" not in skipped:
+            rprint(f"[bold green][+][/bold green] URLFinder (pingc0y)")
+            try:
+                cmd = f"URLFinder -u {base} -s all -m 3 -z 2 -t 50"
+                if args.proxy:
+                    cmd += f" -x {args.proxy}"
+                out = run_cmd(cmd, "URLFinder (pingc0y deep extract)", timeout=args.timeout)
+                extracted = extract_urls_from_urlfinder_json(out) or extract_clean_urls(out)
+                new_added = len(extracted - local)
+                local.update(extracted)
+                tool_counts["URLFinder (pingc0y)"].update(extracted)
+                if new_added > 0:
+                    discovered_count += new_added
+                    progress.update(task, description=f"[cyan]Harvesting... (discovered so far: {discovered_count:,} URLs)[/cyan]")
+            except Exception as e:
+                rprint(f"[bold yellow]URLFinder skipped: {e}[/bold yellow]")
+
+        return local
+
+    # Live progress with real-time count
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        transient=True
+    ) as progress:
+        task = progress.add_task("[cyan]Harvesting domains... (discovered so far: 0 URLs)", total=len(domains))
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures = [ex.submit(harvest, d) for d in domains]
+            for future in as_completed(futures):
+                try:
+                    all_urls.update(future.result())
+                except Exception as e:
+                    rprint(f"[bold red]Domain harvest failed: {e}[/bold red]")
+                progress.advance(task)
+
+    # Subdomain expansion
+    if args.include_subs:
+        rprint("[bold yellow][*] Expanding subdomains...[/bold yellow]")
+        for d in domains:
+            cmd = f"subfinder -d {d} -silent"
+            if args.proxy: cmd += f" -proxy {args.proxy}"
+            out = run_cmd(cmd, "subfinder", args.timeout)
+            extracted = extract_clean_urls(out)
+            all_urls.update(extracted)
+            tool_counts["subfinder"].update(extracted)
+
+    # Tool contribution table
+    console.rule("[bold cyan]Tool Contribution Summary[/bold cyan]", style="cyan")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Tool", style="cyan")
+    table.add_column("URLs Found", justify="right", style="green")
+    for tool in sorted(tool_counts.keys()):
+        table.add_row(tool, str(len(tool_counts[tool])))
+    table.add_row("[bold]TOTAL BEFORE URO[/bold]", str(len(all_urls)), style="bold yellow")
+    rprint(table)
+
+    urls_list = sorted(all_urls)
+
+    # URO by default
+    if not args.no_uro and shutil.which("uro"):
+        rprint("[bold yellow][*] Running uro deduplication...[/bold yellow]")
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+            f.write("\n".join(urls_list))
+            tmp = f.name
+        out = run_cmd(f"uro -i {tmp}")
+        os.unlink(tmp)
+        urls_list = sorted(extract_clean_urls(out))
+        rprint(f"[bold green]After uro → [cyan bold]{len(urls_list)}[/cyan bold] clean URLs[/bold green]")
+
+    # Final filters
+    if args.params_only:
+        rprint("[bold blue][*] Filtering URLs with parameters only...[/bold blue]")
+        urls_list = [u for u in urls_list if '?' in u]
+
+    if args.live and shutil.which("httpx"):
+        rprint("[bold yellow][*] Live filtering with httpx...[/bold yellow]")
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+            f.write("\n".join(urls_list))
+            tmp = f.name
+        cmd = f"httpx -l {tmp} -silent -mc 200,301,302,307,308 -title"
+        if args.proxy: cmd += f" -proxy {args.proxy}"
+        out = run_cmd(cmd)
+        os.unlink(tmp)
+        urls_list = sorted(extract_clean_urls(out))
+
+    # Final output
+    console.rule("[bold green]HARVEST COMPLETE[/bold green]", style="green")
+    rprint(f"[bold green]Final clean unique URLs:[/bold green] [cyan bold]{len(urls_list)}[/cyan bold]")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    txt_file = out_dir / (args.output or f"harvested_urls_{ts}.txt")
+    txt_file.write_text("\n".join(urls_list) + "\n")
+    rprint(f"[bold green]Final file saved →[/bold green] [white]{txt_file}[/white]")
+
+    console.rule(style="cyan")
+    rprint("[dim]Use only on authorized targets. Unauthorized use is illegal.[/dim]")
+
+if __name__ == "__main__":
+    main()
