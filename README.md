@@ -52,6 +52,8 @@ Harvex calls these CLI tools — install whichever you need:
 | [uro](https://github.com/s0md3v/uro) *(optional)* | `pip install uro` |
 | [httpx](https://github.com/projectdiscovery/httpx) *(optional)* | `go install github.com/projectdiscovery/httpx/cmd/httpx@latest` |
 | [subfinder](https://github.com/projectdiscovery/subfinder) *(optional)* | `go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` |
+| [URLFinder pingc0y](https://github.com/pingc0y/URLFinder/) | `git clone https://github.com/pingc0y/URLFinder/` |
+
 
 > Harvex gracefully skips tools that are not installed. You don't need all of them to get started.
 
