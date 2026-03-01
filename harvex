@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Harvex - Ultimate URL Harvester 2026
+██╗  ██╗ █████╗ ██████╗ ██╗   ██╗███████╗██╗  ██╗
+██║  ██║██╔══██╗██╔══██╗██║   ██║██╔════╝╚██╗██╔╝
+███████║███████║██████╔╝██║   ██║█████╗   ╚███╔╝
+██╔══██║██╔══██║██╔══██╗╚██╗ ██╔╝██╔══╝   ██╔██╗
+██║  ██║██║  ██║██║  ██║ ╚████╔╝ ███████╗██╔╝ ██╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝
+Ultimate URL Harvester 2026 — Use only on authorized targets.
 """
 
 import argparse
@@ -10,269 +16,1125 @@ import shutil
 import tempfile
 import os
 import sys
-import signal
-import json
+import glob
+import time
+import copy
+import threading
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Rich for beautiful, colorful output
+# ⚙  USER CONFIGURATION — edit these paths before running
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Full path to TheTimeMachine Python script.
+# TheTimeMachine imports sub-modules relative to its own directory, so the path
+# must point to the actual script inside the cloned repo.
+# Example: "/opt/tools/TheTimeMachine/thetimemachine.py"
+THETIMEMACHINE_PATH = "/home/kali/tools/TheTimeMachine/thetimemachine.py"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rich UI
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from rich.console import Console
     from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
     from rich import print as rprint
-    console = Console()
+    console = Console(highlight=False)
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
     class FakeConsole:
         def print(self, text, **kwargs):
-            color_map = {
-                "green": "\033[92m", "bold green": "\033[1;92m",
-                "yellow": "\033[93m", "bold yellow": "\033[1;93m",
-                "red": "\033[91m", "bold red": "\033[1;91m",
-                "cyan": "\033[96m", "bold cyan": "\033[1;96m",
-                "magenta": "\033[95m", "white": "\033[97m"
-            }
-            style = str(kwargs.get("style", ""))
-            for k, v in color_map.items():
-                if k in style:
-                    print(v + str(text) + "\033[0m")
-                    return
-            print(text)
-        def rule(self, title="", style=""): print("\n" + "-"*70 + f"\n {title} \n" + "-"*70)
+            print(re.sub(r'\[/?[^\]]+\]', '', str(text)))
+        def rule(self, title="", style=""):
+            clean = re.sub(r'\[/?[^\]]+\]', '', str(title))
+            print("\n" + "─" * 70 + f"\n  {clean}\n" + "─" * 70)
     console = FakeConsole()
     rprint = console.print
 
-URL_REGEX = re.compile(r'https?://[^\s<>"\']+')
+# ── Raw terminal helpers — bypass Rich so \r truly overwrites the line ────────
+def _twrite(text: str):
+    """Write raw text to stdout and flush — no Rich markup, no trailing newline."""
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
-def run_cmd(cmd, desc="", timeout=1800):
-    rprint(f"[bold green][+][/bold green] {desc or cmd}")
+def _tclear():
+    """Overwrite current line with spaces then return cursor to start."""
+    sys.stdout.write("\r" + " " * 100 + "\r")
+    sys.stdout.flush()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Globals
+# ──────────────────────────────────────────────────────────────────────────────
+DOMAIN_REGEX_CACHE = {}
+PROXYCHAINS_CONF   = "/tmp/harvex_proxychains.conf"
+TOR_SOCKS5         = "socks5://127.0.0.1:9050"
+_tor_controller    = None
+_tor_lock          = threading.Lock()
+QUIET              = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Banner
+# ──────────────────────────────────────────────────────────────────────────────
+BANNER = """\
+[bold red]██╗  ██╗ █████╗ ██████╗ ██╗   ██╗███████╗██╗  ██╗
+██║  ██║██╔══██╗██╔══██╗██║   ██║██╔════╝╚██╗██╔╝
+███████║███████║██████╔╝██║   ██║█████╗   ╚███╔╝
+██╔══██║██╔══██║██╔══██╗╚██╗ ██╔╝██╔══╝   ██╔██╗
+██║  ██║██║  ██║██║  ██║ ╚████╔╝ ███████╗██╔╝ ██╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝[/bold red]
+[bold cyan]          Ultimate URL Harvester 2026[/bold cyan]  [dim]v2.1 — authorized targets only[/dim]"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Domain-scoped URL filter
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_domain_regex(domain):
+    if domain not in DOMAIN_REGEX_CACHE:
+        escaped = re.escape(domain)
+        pattern = re.compile(
+            r'https?://(?:[a-zA-Z0-9_\-]+\.)*' + escaped + r'(?:[/?#][^\s"\'<>]*)?',
+            re.IGNORECASE
+        )
+        DOMAIN_REGEX_CACHE[domain] = pattern
+    return DOMAIN_REGEX_CACHE[domain]
+
+def filter_urls_for_domain(text, domain):
+    pattern = make_domain_regex(domain)
+    urls = set()
+    for url in pattern.findall(text):
+        url = url.rstrip('.,;)')
+        urls.add(url)
+    return urls
+
+def filter_urls_for_domains(text, domain_list):
+    urls = set()
+    for domain in domain_list:
+        urls.update(filter_urls_for_domain(text, domain))
+    return urls
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tor helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ensure_tor_running():
+    import socket
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, errors='replace')
-        return r.stdout + r.stderr
-    except subprocess.TimeoutExpired:
-        rprint(f"[bold yellow][-] Timeout after {timeout}s[/bold yellow]")
-        return ""
+        s = socket.create_connection(("127.0.0.1", 9051), timeout=2)
+        s.close()
+        return True
+    except Exception:
+        pass
+    rprint("[bold yellow][!] Tor not reachable — attempting to start Tor...[/bold yellow]")
+    r = subprocess.run("sudo systemctl start tor", shell=True, capture_output=True, text=True)
+    if r.returncode == 0:
+        time.sleep(3)
+        rprint("[bold green][+] Tor started successfully ✓[/bold green]")
+        return True
+    rprint(f"[bold red][!] Could not start Tor: {r.stderr.strip()}[/bold red]")
+    return False
+
+def init_tor_controller():
+    global _tor_controller
+    try:
+        from stem.control import Controller
+        ctrl = Controller.from_port(port=9051)
+        ctrl.authenticate()
+        _tor_controller = ctrl
+        rprint("[bold green][+] stem → Tor ControlPort 9051 ✓[/bold green]")
+        return True
+    except ImportError:
+        rprint("[bold red][!] stem not installed: pip3 install stem --break-system-packages[/bold red]")
+        return False
     except Exception as e:
-        rprint(f"[bold red][-] Error: {e}[/bold red]")
+        rprint(f"[bold red][!] Tor controller error: {e}[/bold red]")
+        rprint("[yellow]    Fix: sudo usermod -aG debian-tor $USER && newgrp debian-tor[/yellow]")
+        return False
+
+def rotate_tor_ip():
+    """Send NEWNYM with live countdown (single overwriting line). Returns new exit IP or None."""
+    global _tor_controller
+    if _tor_controller is None:
+        return None
+    try:
+        from stem import Signal
+        with _tor_lock:
+            wait = _tor_controller.get_newnym_wait()
+            if wait > 0:
+                if not QUIET:
+                    for remaining in range(int(wait), 0, -1):
+                        _twrite(f"\r  🔄 New Tor circuit in {remaining}s  ")
+                        time.sleep(1)
+                    _tclear()
+                else:
+                    time.sleep(wait)
+            _tor_controller.signal(Signal.NEWNYM)
+            time.sleep(1)
+        ip = get_tor_exit_ip()
+        return ip
+    except Exception as e:
+        if not QUIET:
+            rprint(f"[bold yellow][!] NEWNYM failed: {e}[/bold yellow]")
+        return None
+
+def get_tor_exit_ip(timeout=12):
+    """Fetch exit IP via proxychains4 curl.
+    Uses raw sys.stdout writes so the spinner truly overwrites a single line.
+    """
+    result = [None]
+    done   = threading.Event()
+
+    def _fetch():
+        try:
+            r = subprocess.run(
+                "proxychains4 -q curl -s --max-time 8 https://api.ipify.org",
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            ip = r.stdout.strip()
+            if re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                result[0] = ip
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_fetch, daemon=True)
+    t.start()
+
+    spin_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    waited = 0.0
+    idx    = 0
+    while not done.wait(timeout=0.12) and waited < timeout:
+        if not QUIET:
+            _twrite(f"\r  🧅 fetching exit IP {spin_chars[idx % len(spin_chars)]}  ")
+        waited += 0.12
+        idx    += 1
+
+    # Erase the spinner line completely before caller prints anything
+    if not QUIET:
+        _tclear()
+
+    done.set()
+    t.join(timeout=0.3)
+    return result[0]
+
+def get_tor_circuit_info():
+    """Return (entry_fingerprint, exit_fingerprint) of the best BUILT circuit.
+
+    Tries multiple strategies to find a usable circuit because stem's
+    circuit list ordering and status values can vary by version:
+      1. Status string "BUILT" with 3-hop path (ideal)
+      2. Status string "BUILT" with any path >= 2 hops
+      3. Any circuit with a path >= 2 hops as fallback
+    """
+    if _tor_controller is None:
+        return None, None
+    try:
+        circuits = list(_tor_controller.get_circuits())
+        if not circuits:
+            return None, None
+
+        # Strategy 1 & 2: prefer explicitly BUILT circuits
+        best = None
+        for circ in circuits:
+            status_str = str(circ.status).upper()
+            path = circ.path or []
+            if status_str == "BUILT" and len(path) >= 2:
+                if best is None or len(path) > len(best.path):
+                    best = circ
+
+        # Strategy 3: any circuit with a usable path
+        if best is None:
+            for circ in circuits:
+                path = circ.path or []
+                if len(path) >= 2:
+                    best = circ
+                    break
+
+        if best and best.path and len(best.path) >= 2:
+            entry = best.path[0][0]   # guard / entry fingerprint
+            exit_ = best.path[-1][0]  # exit node fingerprint
+            return entry, exit_
+
+    except Exception as e:
+        if not QUIET:
+            rprint(f"[dim yellow]  [tor] circuit info error: {e}[/dim yellow]")
+    return None, None
+
+def print_tor_panel(label="Tor Status"):
+    if not HAS_RICH or QUIET:
+        return
+    exit_ip  = get_tor_exit_ip()
+    entry_fp, exit_fp = get_tor_circuit_info()
+    lines = [
+        f"[bold green]🧅  {label}[/bold green]",
+        f"  [cyan]Exit IP    :[/cyan]  [bold white]{exit_ip or 'unknown'}[/bold white]",
+    ]
+    if entry_fp:
+        lines.append(f"  [cyan]Entry Node :[/cyan]  [dim]{entry_fp[:24]}[/dim]")
+    else:
+        lines.append(f"  [cyan]Entry Node :[/cyan]  [dim yellow]unavailable[/dim yellow]")
+    if exit_fp:
+        lines.append(f"  [cyan]Exit  Node :[/cyan]  [dim]{exit_fp[:24]}[/dim]")
+    else:
+        lines.append(f"  [cyan]Exit  Node :[/cyan]  [dim yellow]unavailable[/dim yellow]")
+    lines += [
+        "  [cyan]SOCKS      :[/cyan]  [dim]127.0.0.1:9050[/dim]",
+        "  [cyan]Control    :[/cyan]  [dim]127.0.0.1:9051  (CookieAuth)[/dim]",
+    ]
+    console.print(Panel("\n".join(lines), border_style="green", padding=(0, 2)))
+
+def write_proxychains_conf():
+    Path(PROXYCHAINS_CONF).write_text(
+        "# Harvex — auto-generated\ndynamic_chain\nproxy_dns\n"
+        "remote_dns_subnet 224\ntcp_read_time_out 15000\ntcp_connect_time_out 8000\n\n"
+        "[ProxyList]\nsocks5  127.0.0.1  9050\n"
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TheTimeMachine output collector
+# ──────────────────────────────────────────────────────────────────────────────
+
+def collect_thetimemachine_output(domain, ttm_dir=None):
+    """
+    TheTimeMachine writes results to a 'content/<domain>/' directory.
+    It may be relative to its own script dir OR the cwd. Check both.
+    Also tries common variations of the domain folder name.
+    """
+    urls = set()
+
+    # Build candidate base directories to search
+    search_dirs = [os.getcwd()]
+    if ttm_dir:
+        search_dirs.append(ttm_dir)
+    # Deduplicate
+    search_dirs = list(dict.fromkeys(search_dirs))
+
+    # Domain folder variations TheTimeMachine might use
+    domain_variants = [domain, domain.replace(".", "_"), domain.split(".")[0]]
+
+    patterns_tried = []
+    for base in search_dirs:
+        for variant in domain_variants:
+            for pattern in [
+                os.path.join(base, "content", variant, "*.txt"),
+                os.path.join(base, "content", variant, "**", "*.txt"),
+                os.path.join(base, variant, "*.txt"),
+            ]:
+                patterns_tried.append(pattern)
+                for f in glob.glob(pattern, recursive=True):
+                    try:
+                        text = Path(f).read_text(errors='replace')
+                        found = filter_urls_for_domain(text, domain)
+                        urls.update(found)
+                    except Exception:
+                        pass
+
+    if not QUIET:
+        rprint(f"[dim]  [TTM] Scanned {len(patterns_tried)} path patterns → {len(urls)} URLs collected from files[/dim]")
+
+    return urls
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core execution engine — real-time streaming with live counter
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_tool_live(name, cmd, domain_list, use_proxychains=True,
+                  tool_type="go", on_url=None):
+    """
+    Execute a tool and stream its output line by line in real time.
+    Shows a single overwriting status line:
+        ⚡ [tool]  collecting: N urls  [Xs]  🧅 IP
+
+    tool_type:
+      "python" — wrap with proxychains4 bash -c
+      "go"     — proxy flag already in cmd
+      "direct" — no proxy, run as-is
+    """
+    global QUIET
+
+    # ── Tor rotation before tool starts ──────────────────────────────────────
+    new_ip   = None
+    entry_fp = None
+    exit_fp  = None
+
+    if use_proxychains:
+        new_ip             = rotate_tor_ip()          # single spinner, then clears line
+        entry_fp, exit_fp  = get_tor_circuit_info()
+
+    # ── Resolve IP in background if still None ────────────────────────────────
+    if use_proxychains and new_ip is None:
+        new_ip = get_tor_exit_ip()                    # one more attempt, spinner clears itself
+
+    # ── Build tor display strings ─────────────────────────────────────────────
+    if use_proxychains:
+        ip_disp  = f"[bold green]{new_ip}[/bold green]"   if new_ip   else "[dim yellow]unknown[/dim yellow]"
+        en_disp  = f"[dim]{entry_fp[:20]}[/dim]"          if entry_fp else "[dim yellow]—[/dim yellow]"
+        ex_disp  = f"[dim]{exit_fp[:20]}[/dim]"           if exit_fp  else "[dim yellow]—[/dim yellow]"
+        tor_line = (
+            f"\n  [cyan]🧅 Exit IP:[/cyan] {ip_disp}  "
+            f"[cyan]Entry:[/cyan] {en_disp}  "
+            f"[cyan]Exit:[/cyan]  {ex_disp}"
+        )
+    else:
+        tor_line = ""
+
+    # ── Print tool header ─────────────────────────────────────────────────────
+    if not QUIET and HAS_RICH:
+        console.print(Panel(
+            f"[bold yellow]⚡ {name}[/bold yellow]{tor_line}",
+            border_style="yellow", padding=(0, 2)
+        ))
+    elif not QUIET:
+        rprint(f"\n[*] {name}  Tor: {new_ip or 'unknown'}")
+
+    # ── Build final command ───────────────────────────────────────────────────
+    if use_proxychains and tool_type == "python" and shutil.which("proxychains4"):
+        safe = cmd.replace("'", "'\\''")
+        cmd  = f"proxychains4 -f {PROXYCHAINS_CONF} -q bash -c '{safe}'"
+
+    # ── Stream output in real time ────────────────────────────────────────────
+    url_count  = 0
+    start_ts   = time.time()
+    _proc_done = threading.Event()
+
+    def _status_line_raw():
+        """Plain text status for raw sys.stdout (no Rich markup)."""
+        tor_bit = f"  🧅 {new_ip}" if (use_proxychains and new_ip) else ""
+        secs = int(time.time() - start_ts)
+        m, s = divmod(secs, 60)
+        elapsed = f"{m}m {s:02d}s" if m else f"{s}s"
+        return f"\r  ⚡ {name}  collecting: {url_count:,} urls  [{elapsed}]{tor_bit}  "
+
+    def _ticker():
+        """Background thread: rewrite status line every second so timer never freezes."""
+        while not _proc_done.wait(timeout=1.0):
+            if not QUIET:
+                _twrite(_status_line_raw())
+
+    ticker_thread = threading.Thread(target=_ticker, daemon=True)
+
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors='replace'
+        )
+
+        ticker_thread.start()
+
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            line_urls = filter_urls_for_domains(line, domain_list)
+            for url in line_urls:
+                url_count += 1
+                if on_url:
+                    on_url(url)
+
+        proc.wait()
+        stderr_out = proc.stderr.read()
+
+    except KeyboardInterrupt:
+        _proc_done.set()
+        try: proc.terminate()
+        except Exception: pass
+        raise
+    except Exception as e:
+        _proc_done.set()
+        if not QUIET:
+            rprint(f"[bold red]  [-] {name} error: {e}[/bold red]")
+        return 0, ""
+    finally:
+        _proc_done.set()
+        ticker_thread.join(timeout=1.5)
+
+    # ── Final summary line ────────────────────────────────────────────────────
+    if not QUIET:
+        _tclear()
+        secs = int(time.time() - start_ts)
+        m, s = divmod(secs, 60)
+        elapsed_str = f"{m}m {s:02d}s" if m else f"{s}s"
+        icon = "✓" if url_count > 0 else "○"
+        if HAS_RICH:
+            color = "bold green" if url_count > 0 else "dim yellow"
+            console.print(
+                f"  [{color}]{icon}[/{color}] [cyan]{name}[/cyan]  "
+                f"[bold white]+{url_count:,} URLs[/bold white]  "
+                f"[dim]elapsed: {elapsed_str}[/dim]"
+            )
+        else:
+            rprint(f"  {icon} {name}: +{url_count}  elapsed: {elapsed_str}")
+
+    return url_count, stderr_out
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _exec — for non-streaming tools (uro, httpx, subfinder)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _exec(cmd, extra_env=None):
+    env = None
+    if extra_env:
+        env = copy.copy(os.environ)
+        env.update(extra_env)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True,
+                           text=True, errors='replace', env=env)
+        return r.stdout + r.stderr
+    except Exception as e:
+        rprint(f"[bold red]  [-] Error: {e}[/bold red]")
         return ""
 
-def extract_clean_urls(text):
-    urls = {m.group(0).split('#')[0].rstrip('/') for m in URL_REGEX.finditer(text)}
-    exclude = {'.png','.jpg','.jpeg','.gif','.svg','.css','.woff','.ttf','.woff2','.ico','.pdf','.eot','.otf'}
-    return {u for u in urls if not any(u.lower().endswith(ext) for ext in exclude)}
+# ──────────────────────────────────────────────────────────────────────────────
+# Final summary
+# ──────────────────────────────────────────────────────────────────────────────
 
-def extract_urls_from_urlfinder_json(json_text):
-    try:
-        data = json.loads(json_text)
-        return {item.get("url") for item in data if isinstance(item, dict) and "url" in item}
-    except:
-        return set()
+def print_final_summary(tool_counts, total_before, total_final,
+                        out_file, start_time, use_pc):
+    if not HAS_RICH:
+        rprint("\n=== HARVEST COMPLETE ===")
+        for t, urls in sorted(tool_counts.items(), key=lambda x: -len(x[1])):
+            rprint(f"  {t}: {len(urls):,}")
+        rprint(f"  FINAL: {total_final:,}")
+        return
+
+    elapsed = datetime.now() - start_time
+    mins, s = divmod(int(elapsed.total_seconds()), 60)
+
+    console.rule("[bold magenta]  HARVEST SUMMARY  [/bold magenta]", style="magenta")
+
+    tbl = Table(
+        title="[bold cyan]URL Harvest — Tool Breakdown[/bold cyan]",
+        box=box.DOUBLE_EDGE, border_style="cyan",
+        header_style="bold magenta", show_lines=True,
+    )
+    tbl.add_column("🔧  Tool",  style="cyan",       min_width=28)
+    tbl.add_column("🌐  URLs",  style="bold green",  justify="right", min_width=12)
+    tbl.add_column("📊  Share", style="yellow",      justify="right", min_width=8)
+
+    sorted_tools = sorted(tool_counts.items(), key=lambda x: -len(x[1]))
+    for tool, urls in sorted_tools:
+        cnt = len(urls)
+        pct = f"{cnt / total_before * 100:.1f}%" if total_before else "—"
+        tbl.add_row(tool, f"{cnt:,}", pct)
+
+    tbl.add_section()
+    tbl.add_row(
+        "[bold white]TOTAL (raw)[/bold white]",
+        f"[bold yellow]{total_before:,}[/bold yellow]",
+        "[bold yellow]100%[/bold yellow]",
+    )
+    tbl.add_row(
+        "[bold white]TOTAL (final)[/bold white]",
+        f"[bold green]{total_final:,}[/bold green]",
+        f"[bold green]{total_final / total_before * 100:.1f}%[/bold green]" if total_before else "—",
+    )
+    console.print(tbl)
+
+    console.print(Panel(
+        f"[bold green]✅  Final unique URLs   :[/bold green]  [bold white]{total_final:,}[/bold white]\n"
+        f"[bold cyan]📁  Saved to            :[/bold cyan]  [white]{out_file}[/white]\n"
+        f"[bold yellow]⏱   Elapsed             :[/bold yellow]  [white]{mins}m {s:02d}s[/white]\n"
+        f"[bold magenta]🧅  Tor / proxychains4  :[/bold magenta]  "
+        f"[white]{'✅ Enabled — IP rotated per tool' if use_pc else '❌ Disabled'}[/white]",
+        title="[bold green]📈  Run Statistics[/bold green]",
+        border_style="green", padding=(0, 2)
+    ))
+    console.print(Panel(
+        "[bold cyan]sudo cp $HOME/go/bin/* /usr/local/bin[/bold cyan]\n"
+        "[dim]Ensure all Go tools are accessible system-wide.[/dim]",
+        title="[bold yellow]📌 Reminder[/bold yellow]",
+        border_style="yellow", padding=(0, 2)
+    ))
+    console.rule(style="cyan")
+    rprint("[dim]Use only on authorized targets. Unauthorized use is illegal.[/dim]")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# main()
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    global QUIET
+
     parser = argparse.ArgumentParser(
-        description="[bold cyan]Harvex - Ultimate URL Harvester 2026[/bold cyan]\n"
-                    "All-in-one passive + active URL & endpoint discovery tool\n"
-                    "Use only on authorized targets. Unauthorized scanning is illegal.",
+        description="Harvex — Ultimate URL Harvester 2026",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("-t", "--target", help="Single domain")
-    parser.add_argument("-l", "--list", help="File with list of domains")
-    parser.add_argument("-p", "--proxy", help="Proxy URL (http:// or socks5://)")
-    parser.add_argument("-o", "--output", help="Final TXT file")
-    parser.add_argument("-oj", "--output-json", help="Final JSON file")
-    parser.add_argument("-oh", "--output-html", help="Final HTML report")
-    parser.add_argument("--output-dir", default="results", help="Output directory")
-    parser.add_argument("--include-subs", action="store_true", help="Enumerate subdomains first")
-    parser.add_argument("--live", action="store_true", help="Filter only live/responding URLs")
-    parser.add_argument("--no-uro", action="store_true", help="Skip uro deduplication (default: ON)")
-    parser.add_argument("--params-only", action="store_true", help="Keep only URLs with parameters")
-    parser.add_argument("--js-endpoints", action="store_true", help="Run LinkFinder on .js files")
-    parser.add_argument("--save-raw", action="store_true", help="Save raw tool outputs")
-    parser.add_argument("--auto-install", action="store_true", help="Try to auto-install missing tools")
-    parser.add_argument("--depth", type=int, default=10, help="Crawl depth (default: 10)")
-    parser.add_argument("--js", action="store_true", help="Enable JS parsing")
-    parser.add_argument("--skip", help="Comma-separated tools to skip (e.g. waymore,gospider)")
-    parser.add_argument("--timeout", type=int, default=1800, help="Per-tool timeout in seconds")
+    parser.add_argument("-t",  "--target",        help="Single domain (e.g. evil.com)")
+    parser.add_argument("-l",  "--list",           help="File with list of domains (one per line)")
+    parser.add_argument("-p",  "--proxy",          help="Proxy URL (http:// or socks5://)")
+    parser.add_argument("-o",  "--output",         help="Output TXT filename")
+    parser.add_argument("--output-dir",            default="results", help="Output dir (default: results)")
+    parser.add_argument("--include-subs",          action="store_true", help="Enumerate subdomains via subfinder")
+    parser.add_argument("--live",                  action="store_true", help="Filter live URLs via httpx")
+    parser.add_argument("--no-uro",                action="store_true", help="Skip uro deduplication")
+    parser.add_argument("--params-only",           action="store_true", help="Keep only URLs with parameters")
+    parser.add_argument("--save-raw",              action="store_true", help="Save raw tool outputs")
+    parser.add_argument("--auto-install",          action="store_true", help="Print install commands and exit")
+    parser.add_argument("--skip",                  help="Comma-separated tool names to skip")
+    parser.add_argument("--dry-run",               action="store_true", help="Check installed tools without harvesting")
+    parser.add_argument("--no-proxychains",        action="store_true", help="Disable Tor/proxychains4")
+    parser.add_argument("-q", "--quiet",           action="store_true", help="Minimal output (pipe-friendly)")
     args = parser.parse_args()
 
-    if not args.target and not args.list:
-        console.rule("[bold magenta]Harvex Help Menu[/bold magenta]", style="magenta")
-        rprint("[yellow bold]WARNING: Use only on targets you have explicit written permission to test.[/yellow bold]")
-        rprint("[yellow]Unauthorized scanning may violate laws and terms of service.[/yellow]\n")
+    QUIET = args.quiet
+
+    # ── Banner ────────────────────────────────────────────────────────────────
+    if not QUIET:
+        if HAS_RICH:
+            console.print(BANNER)
+            console.rule(style="red")
+        else:
+            print(__doc__)
+
+    # ── Auto-install ──────────────────────────────────────────────────────────
+    if args.auto_install:
+        console.rule("[bold cyan]Installation Commands[/bold cyan]")
+        for line in [
+            "# ── Python ──────────────────────────────────────────────────────",
+            "pip3 install waymore uro stem rich --break-system-packages",
+            "# ── Go tools ─────────────────────────────────────────────────────",
+            "go install -v github.com/lc/gau/v2/cmd/gau@latest",
+            "go install -v github.com/tomnomnom/waybackurls@latest",
+            "go install -v github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest",
+            "go install -v github.com/projectdiscovery/katana/cmd/katana@latest",
+            "go install -v github.com/hakluke/hakrawler@latest",
+            "go install -v github.com/edoardottt/cariddi/cmd/cariddi@latest",
+            "go install -v github.com/jaeles-project/gospider@latest",
+            "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest",
+            "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+            "# ── URLFinder (pingc0y) ───────────────────────────────────────────",
+            "# git clone https://github.com/pingc0y/URLFinder && cd URLFinder",
+            "# go build -o URLFinder main.go && cp URLFinder $HOME/go/bin/",
+            "# ── TheTimeMachine ───────────────────────────────────────────────",
+            "# git clone https://github.com/anmolksachan/TheTimeMachine",
+            f"# Set THETIMEMACHINE_PATH = \"/path/to/TheTimeMachine/thetimemachine.py\" in script",
+            "# ── Tor + proxychains4 ───────────────────────────────────────────",
+            "sudo apt install tor proxychains4 -y",
+            "sudo usermod -aG debian-tor $USER",
+            "# /etc/tor/torrc: add MaxCircuitDirtiness 10 + NewCircuitPeriod 10",
+            "sudo systemctl enable tor && sudo systemctl start tor",
+            "# ── Go bins → system ─────────────────────────────────────────────",
+            "sudo cp $HOME/go/bin/* /usr/local/bin",
+        ]:
+            rprint(f"[cyan]{line}[/cyan]")
+        sys.exit(0)
+
+    if not args.target and not args.list and not args.dry_run:
         parser.print_help()
         sys.exit(1)
 
-    console.rule("[bold cyan]Harvex - Ultimate URL Harvester 2026[/bold cyan]")
+    # ── Tor / proxychains init ────────────────────────────────────────────────
+    use_pc = not args.no_proxychains
+
+    if use_pc:
+        if not shutil.which("proxychains4"):
+            rprint("[bold red][!] proxychains4 not found: sudo apt install proxychains4[/bold red]")
+            rprint("[yellow]    Or skip Tor: --no-proxychains[/yellow]")
+            sys.exit(1)
+        if not ensure_tor_running():
+            rprint("[yellow]    Or skip Tor: --no-proxychains[/yellow]")
+            sys.exit(1)
+        if not init_tor_controller():
+            rprint("[yellow]    Or skip Tor: --no-proxychains[/yellow]")
+            sys.exit(1)
+        write_proxychains_conf()
+        if not QUIET:
+            print_tor_panel("Startup — Initial Circuit")
+    else:
+        if not QUIET and HAS_RICH:
+            console.print(Panel(
+                "[bold yellow]⚠  Tor / proxychains4 DISABLED[/bold yellow]\n"
+                "[dim]Running direct — no IP rotation.[/dim]",
+                border_style="yellow", padding=(0, 2)
+            ))
+
+    # ── Dry run ───────────────────────────────────────────────────────────────
+    if args.dry_run:
+        TOOLS = {
+            "waymore":       ("waymore",      "pip3 install waymore --break-system-packages"),
+            "gau":           ("gau",          "go install github.com/lc/gau/v2/cmd/gau@latest"),
+            "waybackurls":   ("waybackurls",  "go install github.com/tomnomnom/waybackurls@latest"),
+            "urlfinder":     ("urlfinder",    "go install github.com/projectdiscovery/urlfinder/cmd/urlfinder@latest"),
+            "katana":        ("katana",       "go install github.com/projectdiscovery/katana/cmd/katana@latest"),
+            "hakrawler":     ("hakrawler",    "go install github.com/hakluke/hakrawler@latest"),
+            "cariddi":       ("cariddi",      "go install github.com/edoardottt/cariddi/cmd/cariddi@latest"),
+            "gospider":      ("gospider",     "go install github.com/jaeles-project/gospider@latest"),
+            "URLFinder":     ("URLFinder",    "https://github.com/pingc0y/URLFinder (manual build)"),
+            "uro":           ("uro",          "pip3 install uro --break-system-packages"),
+            "httpx":         ("httpx",        "go install github.com/projectdiscovery/httpx/cmd/httpx@latest"),
+            "subfinder":     ("subfinder",    "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"),
+            "proxychains4":  ("proxychains4", "sudo apt install proxychains4 -y"),
+            "tor":           ("tor",          "sudo apt install tor -y"),
+            "stem (python)": ("python3",      "pip3 install stem --break-system-packages"),
+        }
+        console.rule("[bold cyan]🔍  Dry Run — Tool Check[/bold cyan]", style="cyan")
+        if HAS_RICH:
+            tbl = Table(
+                box=box.DOUBLE_EDGE, border_style="cyan",
+                header_style="bold magenta", show_lines=True,
+                title="[bold cyan]Installed Tools[/bold cyan]"
+            )
+            tbl.add_column("🔧  Tool",   style="cyan", min_width=20)
+            tbl.add_column("✅  Status",              min_width=16)
+            tbl.add_column("📦  Install", style="dim", min_width=30)
+            installed = 0
+            for display, (binary, install_cmd) in TOOLS.items():
+                found = shutil.which(binary) is not None
+                if display == "stem (python)":
+                    try:
+                        import stem; found = True
+                    except ImportError:
+                        found = False
+                if display == "tor":
+                    import socket
+                    try:
+                        s = socket.create_connection(("127.0.0.1", 9050), timeout=1)
+                        s.close()
+                        found = True
+                    except Exception:
+                        found = shutil.which("tor") is not None
+                status = (
+                    "[bold green]✅ Installed[/bold green]"
+                    if found else
+                    "[bold red]❌ Missing[/bold red]"
+                )
+                tbl.add_row(display, status, "—" if found else install_cmd)
+                if found:
+                    installed += 1
+            console.print(tbl)
+            console.print(Panel(
+                f"[bold green]Installed:[/bold green] [white]{installed}/{len(TOOLS)}[/white]  "
+                f"[bold red]Missing:[/bold red] [white]{len(TOOLS) - installed}/{len(TOOLS)}[/white]\n"
+                f"[dim]Run [bold cyan]harvex.py --auto-install[/bold cyan] for all install commands.[/dim]",
+                title="[bold yellow]Dry Run Summary[/bold yellow]",
+                border_style="yellow", padding=(0, 2)
+            ))
+        sys.exit(0)
+
+    # ── Load domains ──────────────────────────────────────────────────────────
+    domains = []
+    if args.target:
+        d = args.target.strip().lower()
+        d = re.sub(r'^https?://', '', d).rstrip("/")
+        domains.append(d)
+    if args.list:
+        try:
+            for line in open(args.list):
+                d = line.strip().lower()
+                d = re.sub(r'^https?://', '', d).rstrip("/")
+                if d:
+                    domains.append(d)
+        except Exception as e:
+            rprint(f"[bold red]Error reading list: {e}[/bold red]")
+            sys.exit(1)
+    domains = list(dict.fromkeys(domains))   # deduplicate, preserve order
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(exist_ok=True)
     (out_dir / "raw").mkdir(exist_ok=True)
 
-    domains = []
-    if args.target:
-        domains.append(args.target.strip())
-    if args.list:
-        try:
-            with open(args.list) as f:
-                domains.extend([line.strip() for line in f if line.strip()])
-        except Exception as e:
-            rprint(f"[bold red]Error reading list file: {e}[/bold red]")
-            sys.exit(1)
-
-    rprint(f"[bold green]Starting harvest for [cyan]{len(domains)}[/cyan] domain(s)...[/bold green]")
-
-    all_urls = set()
-    tool_counts = defaultdict(set)
-    skipped = [x.strip() for x in args.skip.split(",")] if args.skip else []
+    skipped_tools    = [x.strip().lower() for x in args.skip.split(",")] if args.skip else []
+    all_urls         = set()
+    tool_counts      = defaultdict(set)
     discovered_count = 0
+    start_time       = datetime.now()
+    TOR              = TOR_SOCKS5
 
-    def harvest(domain):
+    if not QUIET and HAS_RICH:
+        console.print(Panel(
+            f"[bold cyan]Targets   :[/bold cyan] [white]{', '.join(domains[:3])}{'...' if len(domains) > 3 else ''}[/white]\n"
+            f"[bold cyan]Count     :[/bold cyan] [white]{len(domains)} domain(s)[/white]\n"
+            f"[bold cyan]Tor / PC  :[/bold cyan] [white]{'✅ Enabled' if use_pc else '❌ Disabled'}[/white]\n"
+            f"[bold cyan]Skip      :[/bold cyan] [white]{', '.join(skipped_tools) or 'none'}[/white]\n"
+            f"[bold cyan]Quiet     :[/bold cyan] [white]{'✅ Yes' if QUIET else '❌ No'}[/white]",
+            title="[bold magenta]⚙  Configuration[/bold magenta]",
+            border_style="magenta", padding=(0, 2)
+        ))
+
+    # ── Central URL collector ─────────────────────────────────────────────────
+    _lock = threading.Lock()
+
+    def add_url(tool_name, url, local_set):
         nonlocal discovered_count
-        local = set()
-        base = f"https://{domain}"
+        with _lock:
+            if url not in local_set:
+                local_set.add(url)
+                all_urls.add(url)
+                tool_counts[tool_name].add(url)
+                discovered_count += 1
 
-        tasks = [
-            ("waymore",     f"waymore -i {domain} --stream"),
-            ("gau",         f"gau --subs {domain} --blacklist png,jpg,jpeg,gif,svg,css,woff,ttf,woff2,ico"),
-            ("waybackurls", f"echo {domain} | waybackurls"),
-            ("urlfinder",   f"urlfinder -d {domain} -silent"),
-            ("katana",      f"katana -u {base} -d {args.depth} -silent -c 50 {'-jc' if args.js else ''}"),
-            ("hakrawler",   f"echo {base} | hakrawler -d {min(5, args.depth)} -plain -subs"),
-            ("cariddi",     f"echo {base} | cariddi -md {args.depth} -plain"),
-            ("gospider",    f"gospider -s {base} -d {args.depth} -c 30 -t 20 -q --js --subs -a -r -K 2"),
-        ]
+    def is_skipped(name):
+        return name.lower() in skipped_tools
 
-        for name, cmd in tasks:
-            if name in skipped:
-                rprint(f"[bold yellow][SKIP] {name}[/bold yellow]")
-                continue
+    def check(binary):
+        return shutil.which(binary) is not None
 
-            full_cmd = cmd
-            if args.proxy:
-                if name in ["katana", "urlfinder", "hakrawler", "cariddi"]:
-                    full_cmd += f" -proxy {args.proxy}"
-                elif name == "gospider":
-                    full_cmd += f" -p {args.proxy}"
+    def save_raw(name, content, tag=""):
+        if args.save_raw and content:
+            fname = f"{name}_{tag}.txt" if tag else f"{name}.txt"
+            (out_dir / "raw" / fname).write_text(content)
 
-            out = run_cmd(full_cmd, name, timeout=args.timeout)
-            extracted = extract_clean_urls(out)
-            new_added = len(extracted - local)
+    # ─────────────────────────────────────────────────────────────────────────
+    # TheTimeMachine dedicated runner
+    # TheTimeMachine writes results to disk, not stdout — needs special handling
+    # ─────────────────────────────────────────────────────────────────────────
+    def _run_thetimemachine(domain, ttm_dir, ttm_script, local_set, use_proxychains):
+        name = "TheTimeMachine"
 
-            local.update(extracted)
-            tool_counts[name].update(extracted)
+        # Tor rotate + get circuit info first
+        new_ip   = None
+        entry_fp = None
+        exit_fp  = None
+        if use_proxychains:
+            new_ip             = rotate_tor_ip()
+            entry_fp, exit_fp  = get_tor_circuit_info()
+            if new_ip is None:
+                new_ip = get_tor_exit_ip()
 
-            if new_added > 0:
-                discovered_count += new_added
-                progress.update(task, description=f"[cyan]Harvesting... (discovered so far: {discovered_count:,} URLs)[/cyan]")
+        # Build display strings for the panel
+        if use_proxychains:
+            ip_disp  = new_ip or "unknown"
+            en_disp  = entry_fp[:20] if entry_fp else "—"
+            ex_disp  = exit_fp[:20]  if exit_fp  else "—"
+            tor_line = f"\n  🧅 Exit IP: {ip_disp}  Entry: {en_disp}  Exit:  {ex_disp}"
+        else:
+            tor_line = ""
 
-            if args.save_raw and out:
-                (out_dir / "raw" / f"{name}_{domain.replace('.', '_')}.txt").write_text(out)
+        if not QUIET and HAS_RICH:
+            console.print(Panel(
+                f"[bold yellow]⚡ {name}[/bold yellow]{tor_line}",
+                border_style="yellow", padding=(0, 2)
+            ))
 
-        # pingc0y/URLFinder
-        if shutil.which("URLFinder") and "URLFinder" not in skipped:
-            rprint(f"[bold green][+][/bold green] URLFinder (pingc0y)")
-            try:
-                cmd = f"URLFinder -u {base} -s all -m 3 -z 2 -t 50"
-                if args.proxy:
-                    cmd += f" -x {args.proxy}"
-                out = run_cmd(cmd, "URLFinder (pingc0y deep extract)", timeout=args.timeout)
-                extracted = extract_urls_from_urlfinder_json(out) or extract_clean_urls(out)
-                new_added = len(extracted - local)
-                local.update(extracted)
-                tool_counts["URLFinder (pingc0y)"].update(extracted)
-                if new_added > 0:
-                    discovered_count += new_added
-                    progress.update(task, description=f"[cyan]Harvesting... (discovered so far: {discovered_count:,} URLs)[/cyan]")
-            except Exception as e:
-                rprint(f"[bold yellow]URLFinder skipped: {e}[/bold yellow]")
+        # Build command — cd into TTM dir so its relative imports work
+        base_cmd = f"cd {ttm_dir} && python3 {ttm_script} {domain} --fetch"
+        if use_proxychains and shutil.which("proxychains4"):
+            safe = base_cmd.replace("'", "'\\''")
+            cmd  = f"proxychains4 -f {PROXYCHAINS_CONF} -q bash -c '{safe}'"
+        else:
+            cmd = base_cmd
+
+        start_ts   = time.time()
+        _ttm_done  = threading.Event()
+
+        def _ttm_ticker():
+            while not _ttm_done.wait(timeout=1.0):
+                if not QUIET:
+                    secs = int(time.time() - start_ts)
+                    m, s = divmod(secs, 60)
+                    elapsed = f"{m}m {s:02d}s" if m else f"{s}s"
+                    _twrite(f"\r  ⚡ {name}  running...  [{elapsed}]  🧅 {new_ip or ''}  ")
+
+        ttm_ticker = threading.Thread(target=_ttm_ticker, daemon=True)
+
+        try:
+            proc = subprocess.Popen(
+                cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors='replace'
+            )
+
+            ttm_ticker.start()
+
+            # Drain stdout so the process doesn't block on a full pipe buffer
+            for _ in proc.stdout:
+                pass
+
+            proc.wait()
+            stderr_out = proc.stderr.read()
+
+        except KeyboardInterrupt:
+            _ttm_done.set()
+            try: proc.terminate()
+            except Exception: pass
+            raise
+        except Exception as e:
+            _ttm_done.set()
+            _tclear()
+            rprint(f"[bold red]  [-] {name} error: {e}[/bold red]")
+            return
+        finally:
+            _ttm_done.set()
+            ttm_ticker.join(timeout=1.5)
+
+        # ── Now collect the output files TTM wrote to disk ────────────────────
+        _tclear()
+        collected = collect_thetimemachine_output(domain, ttm_dir=ttm_dir)
+
+        secs = int(time.time() - start_ts)
+        m, s = divmod(secs, 60)
+        elapsed_str = f"{m}m {s:02d}s" if m else f"{s}s"
+
+        for url in collected:
+            add_url(name, url, local_set)
+
+        url_count = len(collected)
+        icon  = "✓" if url_count > 0 else "○"
+        color = "bold green" if url_count > 0 else "dim yellow"
+        if not QUIET and HAS_RICH:
+            console.print(
+                f"  [{color}]{icon}[/{color}] [cyan]{name}[/cyan]  "
+                f"[bold white]+{url_count:,} URLs[/bold white]  "
+                f"[dim]elapsed: {elapsed_str}[/dim]"
+            )
+            if url_count == 0:
+                # Show stderr snippet to help diagnose failures
+                if stderr_out and stderr_out.strip():
+                    snippet = stderr_out.strip().splitlines()[-3:]
+                    rprint(f"[dim red]  [TTM stderr] {' | '.join(snippet)}[/dim red]")
+                rprint(f"[dim yellow]  ℹ  {name}: 0 URLs — check THETIMEMACHINE_PATH and that the tool ran successfully[/dim yellow]")
+        elif not QUIET:
+            print(f"  {icon} {name}: +{url_count}  elapsed: {elapsed_str}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Harvest function
+    # ─────────────────────────────────────────────────────────────────────────
+    def harvest(target_domains):
+        local   = set()
+        is_list = len(target_domains) > 1
+        list_file = args.list if is_list else None
+
+        def on_url(tool_name):
+            def _cb(url):
+                add_url(tool_name, url, local)
+            return _cb
+
+        def run(name, cmd, ttype="go", domain_filter=None):
+            if is_skipped(name):
+                return
+            dlist = domain_filter or target_domains
+            count, _ = run_tool_live(
+                name, cmd, dlist,
+                use_proxychains=use_pc,
+                tool_type=ttype,
+                on_url=on_url(name)
+            )
+            if count == 0 and not QUIET:
+                rprint(f"[dim yellow]  ℹ  {name}: 0 URLs matched domain scope[/dim yellow]")
+
+        # ── TheTimeMachine (Python) ───────────────────────────────────────────
+        # TheTimeMachine writes results to content/<domain>/*.txt — it does NOT
+        # print URLs to stdout. We must run it, wait for completion, then read
+        # the output files. A dedicated runner is used instead of run_tool_live.
+        if not is_skipped("thetimemachine"):
+            ttm_path = Path(THETIMEMACHINE_PATH)
+            if ttm_path.exists():
+                ttm_dir    = str(ttm_path.parent)
+                ttm_script = ttm_path.name
+                for d in target_domains:
+                    _run_thetimemachine(d, ttm_dir, ttm_script, local, use_pc)
+            elif not QUIET:
+                rprint(
+                    f"[bold yellow]  [SKIP] TheTimeMachine — not found at:[/bold yellow] "
+                    f"[dim]{THETIMEMACHINE_PATH}[/dim]\n"
+                    f"[dim]  Edit THETIMEMACHINE_PATH at the top of harvex.py[/dim]"
+                )
+
+        # ── waymore (Python — proxychains4 works) ────────────────────────────
+        if not is_skipped("waymore") and check("waymore"):
+            if is_list:
+                run("waymore", f"waymore -i {list_file} -mode U --stream", ttype="python")
+            else:
+                run("waymore", f"waymore -i {target_domains[0]} -mode U --stream", ttype="python")
+        elif not is_skipped("waymore"):
+            rprint("[bold yellow]  [SKIP] waymore — not found[/bold yellow]")
+
+        # ── gau (Go — native --proxy socks5://) ──────────────────────────────
+        if not is_skipped("gau") and check("gau"):
+            pf = f" --proxy {TOR}" if use_pc else ""
+            bl = "--blacklist png,jpg,jpeg,gif,svg,css,woff,ttf,woff2,ico"
+            if is_list:
+                run("gau",
+                    f"cat {list_file} | xargs -I{{}} gau --subs{pf} {bl} {{}}",
+                    ttype="go")
+            else:
+                run("gau",
+                    f"gau --subs{pf} {bl} {target_domains[0]}",
+                    ttype="go")
+        elif not is_skipped("gau"):
+            rprint("[bold yellow]  [SKIP] gau — not found[/bold yellow]")
+
+        # ── waybackurls (Go — no proxy support, run direct) ──────────────────
+        if not is_skipped("waybackurls") and check("waybackurls"):
+            if is_list:
+                run("waybackurls", f"cat {list_file} | waybackurls", ttype="direct")
+            else:
+                run("waybackurls", f"echo {target_domains[0]} | waybackurls", ttype="direct")
+        elif not is_skipped("waybackurls"):
+            rprint("[bold yellow]  [SKIP] waybackurls — not found[/bold yellow]")
+
+        # ── urlfinder (Go — -proxy) ───────────────────────────────────────────
+        if not is_skipped("urlfinder") and check("urlfinder"):
+            pf = f" -proxy {TOR}" if use_pc else ""
+            if is_list:
+                run("urlfinder", f"urlfinder -d {list_file} -silent -all{pf}", ttype="go")
+            else:
+                run("urlfinder",
+                    f"urlfinder -d {target_domains[0]} -silent -all{pf}", ttype="go")
+        elif not is_skipped("urlfinder"):
+            rprint("[bold yellow]  [SKIP] urlfinder — not found[/bold yellow]")
+
+        # ── katana (Go — -proxy) — NOTE: -jc removed per user request ─────────
+        if not is_skipped("katana") and check("katana"):
+            pf = f" -proxy {TOR}" if use_pc else ""
+            if is_list:
+                run("katana",
+                    f"katana -list {list_file} -d 999999 -jsl -kf all -aff -fx -pc -silent{pf}",
+                    ttype="go")
+            else:
+                run("katana",
+                    f"katana -u {target_domains[0]} -d 999999 -jsl -kf all -aff -fx -pc -silent{pf}",
+                    ttype="go")
+        elif not is_skipped("katana"):
+            rprint("[bold yellow]  [SKIP] katana — not found[/bold yellow]")
+
+        # ── hakrawler (no proxy — confirmed working flags) ────────────────────
+        if not is_skipped("hakrawler") and check("hakrawler"):
+            if is_list:
+                run("hakrawler",
+                    f"cat {list_file} | sed 's|^|https://|' | hakrawler -subs -d 999999 --insecure",
+                    ttype="direct")
+            else:
+                run("hakrawler",
+                    f'echo "https://{target_domains[0]}" | hakrawler -subs -d 999999 --insecure',
+                    ttype="direct")
+        elif not is_skipped("hakrawler"):
+            rprint("[bold yellow]  [SKIP] hakrawler — not found[/bold yellow]")
+
+        # ── cariddi (Go — -proxy) — no https:// prefix needed ─────────────────
+        if not is_skipped("cariddi") and check("cariddi"):
+            pf = f" -proxy {TOR}" if use_pc else ""
+            if is_list:
+                run("cariddi",
+                    f"cat {list_file} | cariddi -intensive -plain{pf}",
+                    ttype="go")
+            else:
+                run("cariddi",
+                    f"echo {target_domains[0]} | cariddi -intensive -plain{pf}",
+                    ttype="go")
+        elif not is_skipped("cariddi"):
+            rprint("[bold yellow]  [SKIP] cariddi — not found[/bold yellow]")
+
+        # ── gospider (Go — -p proxy) ──────────────────────────────────────────
+        if not is_skipped("gospider") and check("gospider"):
+            pf = f" -p {TOR}" if use_pc else ""
+            if is_list:
+                run("gospider",
+                    f"gospider -S {list_file} -d 999999 -a -r -K 5 -w -u random{pf}",
+                    ttype="go")
+            else:
+                run("gospider",
+                    f"gospider -s https://{target_domains[0]} -d 999999 -a -r -K 5 -w -u random{pf}",
+                    ttype="go")
+        elif not is_skipped("gospider"):
+            rprint("[bold yellow]  [SKIP] gospider — not found[/bold yellow]")
+
+        # ── URLFinder (Go — -x proxy) — no https:// prefix needed ────────────
+        if not is_skipped("urlfinder_pingc0y") and check("URLFinder"):
+            pf = f" -x {TOR}" if use_pc else ""
+            if is_list:
+                run("URLFinder (pingc0y)",
+                    f"URLFinder -f {list_file} -m 2 -z 3 -s all -max 99999999999{pf}",
+                    ttype="go")
+            else:
+                run("URLFinder (pingc0y)",
+                    f"URLFinder -u {target_domains[0]} -m 2 -z 3 -s all -max 99999999999{pf}",
+                    ttype="go")
+        elif not is_skipped("urlfinder_pingc0y"):
+            rprint("[bold yellow]  [SKIP] URLFinder (pingc0y) — not found[/bold yellow]")
 
         return local
 
-    # Live progress with real-time count
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True
-    ) as progress:
-        task = progress.add_task("[cyan]Harvesting domains... (discovered so far: 0 URLs)", total=len(domains))
+    # ── Run harvest ───────────────────────────────────────────────────────────
+    if not QUIET:
+        console.rule("[bold cyan]🚀  Harvest Starting[/bold cyan]", style="cyan")
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futures = [ex.submit(harvest, d) for d in domains]
-            for future in as_completed(futures):
-                try:
-                    all_urls.update(future.result())
-                except Exception as e:
-                    rprint(f"[bold red]Domain harvest failed: {e}[/bold red]")
-                progress.advance(task)
+    harvest(domains)
 
-    # Subdomain expansion
-    if args.include_subs:
-        rprint("[bold yellow][*] Expanding subdomains...[/bold yellow]")
+    # ── Subdomain expansion ───────────────────────────────────────────────────
+    if args.include_subs and check("subfinder"):
+        if not QUIET:
+            console.rule("[bold yellow]🔍  Subdomain Expansion[/bold yellow]", style="yellow")
         for d in domains:
-            cmd = f"subfinder -d {d} -silent"
-            if args.proxy: cmd += f" -proxy {args.proxy}"
-            out = run_cmd(cmd, "subfinder", args.timeout)
-            extracted = extract_clean_urls(out)
-            all_urls.update(extracted)
-            tool_counts["subfinder"].update(extracted)
+            pf = f" -proxy {TOR}" if use_pc else ""
+            out = _exec(f"subfinder -d {d} -silent{pf}")
+            save_raw("subfinder", out, d)
+            for url in filter_urls_for_domain(out, d):
+                add_url("subfinder", url, all_urls)
 
-    # Tool contribution table
-    console.rule("[bold cyan]Tool Contribution Summary[/bold cyan]", style="cyan")
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Tool", style="cyan")
-    table.add_column("URLs Found", justify="right", style="green")
-    for tool in sorted(tool_counts.keys()):
-        table.add_row(tool, str(len(tool_counts[tool])))
-    table.add_row("[bold]TOTAL BEFORE URO[/bold]", str(len(all_urls)), style="bold yellow")
-    rprint(table)
-
+    total_before_uro = len(all_urls)
     urls_list = sorted(all_urls)
 
-    # URO by default
-    if not args.no_uro and shutil.which("uro"):
-        rprint("[bold yellow][*] Running uro deduplication...[/bold yellow]")
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+    # ── URO dedup ─────────────────────────────────────────────────────────────
+    if not args.no_uro and check("uro"):
+        if not QUIET:
+            console.rule("[bold yellow]🧹  URO Deduplication[/bold yellow]", style="yellow")
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
             f.write("\n".join(urls_list))
             tmp = f.name
-        out = run_cmd(f"uro -i {tmp}")
+        out = _exec(f"uro -i {tmp}")
         os.unlink(tmp)
-        urls_list = sorted(extract_clean_urls(out))
-        rprint(f"[bold green]After uro → [cyan bold]{len(urls_list)}[/cyan bold] clean URLs[/bold green]")
+        deduped = {l.strip() for l in out.splitlines() if l.strip().startswith("http")}
+        if deduped:
+            urls_list = sorted(deduped)
+        if not QUIET:
+            rprint(f"[bold green]  ✓ After uro: [cyan bold]{len(urls_list):,}[/cyan bold] URLs[/bold green]")
+    elif not args.no_uro and not QUIET:
+        rprint("[bold yellow]  [!] uro not found — skipping dedup[/bold yellow]")
 
-    # Final filters
+    # ── Params filter ─────────────────────────────────────────────────────────
     if args.params_only:
-        rprint("[bold blue][*] Filtering URLs with parameters only...[/bold blue]")
         urls_list = [u for u in urls_list if '?' in u]
+        if not QUIET:
+            rprint(f"[bold cyan]  ✓ URLs with params: {len(urls_list):,}[/bold cyan]")
 
-    if args.live and shutil.which("httpx"):
-        rprint("[bold yellow][*] Live filtering with httpx...[/bold yellow]")
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+    # ── Live filter ───────────────────────────────────────────────────────────
+    if args.live and check("httpx"):
+        if not QUIET:
+            console.rule("[bold yellow]🔗  Live URL Filtering[/bold yellow]", style="yellow")
+        with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
             f.write("\n".join(urls_list))
             tmp = f.name
-        cmd = f"httpx -l {tmp} -silent -mc 200,301,302,307,308 -title"
-        if args.proxy: cmd += f" -proxy {args.proxy}"
-        out = run_cmd(cmd)
+        pf  = f" -proxy {TOR}" if use_pc else (f" -proxy {args.proxy}" if args.proxy else "")
+        out = _exec(f"httpx -l {tmp} -silent -mc 200,301,302,307,308{pf}")
         os.unlink(tmp)
-        urls_list = sorted(extract_clean_urls(out))
+        live = {l.strip() for l in out.splitlines() if l.strip().startswith("http")}
+        if live:
+            urls_list = sorted(live)
+        if not QUIET:
+            rprint(f"[bold green]  ✓ Live URLs: {len(urls_list):,}[/bold green]")
+    elif args.live and not QUIET:
+        rprint("[bold yellow]  [!] httpx not found — skipping live filter[/bold yellow]")
 
-    # Final output
-    console.rule("[bold green]HARVEST COMPLETE[/bold green]", style="green")
-    rprint(f"[bold green]Final clean unique URLs:[/bold green] [cyan bold]{len(urls_list)}[/cyan bold]")
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # ── Save output ───────────────────────────────────────────────────────────
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     txt_file = out_dir / (args.output or f"harvested_urls_{ts}.txt")
     txt_file.write_text("\n".join(urls_list) + "\n")
-    rprint(f"[bold green]Final file saved →[/bold green] [white]{txt_file}[/white]")
 
-    console.rule(style="cyan")
-    rprint("[dim]Use only on authorized targets. Unauthorized use is illegal.[/dim]")
+    # ── Final Tor status ──────────────────────────────────────────────────────
+    if use_pc and not QUIET:
+        print_tor_panel("Final — Last Exit Node")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    if not QUIET:
+        print_final_summary(tool_counts, total_before_uro, len(urls_list),
+                            txt_file, start_time, use_pc)
+    else:
+        print(str(txt_file))
+
+    if _tor_controller:
+        try:
+            _tor_controller.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
