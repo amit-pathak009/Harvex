@@ -1,4 +1,4 @@
-# 🕸️ Harvex — Ultimate URL Harvester 2026
+# 🕸️ Harvex — Ultimate URL Harvester
 
 > **The most comprehensive, Tor-routed, multi-tool URL harvesting framework for authorized security reconnaissance.**
 
