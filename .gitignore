@@ -1,31 +1,99 @@
-# Output directories
-results/
-output/
+# ──────────────────────────────────────────────────────────────────────────────
+# Harvex — .gitignore
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Python
+# ── Output / results ──────────────────────────────────────────────────────────
+results/
+*.txt
+!requirements.txt
+
+# ── TheTimeMachine output dir (written next to the script) ───────────────────
+content/
+
+# ── Proxychains auto-generated config ────────────────────────────────────────
+/tmp/harvex_proxychains.conf
+
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
+.Python
+*.egg
 *.egg-info/
 dist/
 build/
-.eggs/
-*.egg
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+pip-wheel-metadata/
+share/python-wheels/
+*.whl
 
-# Virtual environments
+# ── Virtual environments ──────────────────────────────────────────────────────
 venv/
-.venv/
 env/
+.venv/
 .env/
+ENV/
+env.bak/
+venv.bak/
 
-# IDE / OS
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.txt
+config.local.*
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
 *.swp
 *.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Sensitive files
-*.txt
-!requirements.txt
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+ehthumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+*.out
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# ── Raw tool output (only committed if explicitly intended) ───────────────────
+results/raw/
+
+# ── Go build artifacts (if any local Go tools are built here) ─────────────────
+*.exe
+*.test
+*.prof
+vendor/
